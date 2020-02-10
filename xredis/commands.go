@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/go-redis/redis"
+	"github.com/pkg/errors"
 )
 
 var ErrEmptyHash = fmt.Errorf("the hash stored at key is empty")
@@ -39,7 +40,7 @@ func LoadHashKeyEncoded(
 		return nil, err
 	}
 	if len(rs) == 0 {
-		return nil, ErrEmptyHash
+		return nil, errors.WithMessagef(ErrEmptyHash, "key(%s)", key)
 	}
 
 	return encodeFunc(rs)
