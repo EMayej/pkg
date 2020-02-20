@@ -101,11 +101,32 @@ func WithRequestDuration(requestDuration prometheus.ObserverVec) Option {
 	}
 }
 
+// WithOverallRequestDuration sets overallRequestDuration metric of the client
+// pool. overallRequestDuration should has no label left, it merges request
+// duration of all clients in the client pool.
+func WithOverallRequestDuration(overallRequestDuration prometheus.ObserverVec) Option {
+	return func(c *ClientPool) {
+		c.overallRequestDuration = overallRequestDuration
+	}
+}
+
 // WithPoolStats sets poolStats metric of the client pool. pool Stats wants two
 // labels
 func WithPoolStats(poolStats *prometheus.GaugeVec) Option {
 	return func(c *ClientPool) {
 		c.poolStats = poolStats
+	}
+}
+
+// WithOverallPoolStats sets overallPoolStats metric of the client pool. Overall
+// pool Stats wants one label, it sums poolStats of all clients in the client
+// pool.
+//
+// Note that each client has a connection pool, the poolStats means the stats of
+// the connection pool of one client.
+func WithOverallPoolStats(overallPoolStats *prometheus.GaugeVec) Option {
+	return func(c *ClientPool) {
+		c.overallPoolStats = overallPoolStats
 	}
 }
 
@@ -115,7 +136,11 @@ func WithPoolStats(poolStats *prometheus.GaugeVec) Option {
 type ClientPool struct {
 	*Config
 
-	logger          *zap.Logger
+	logger *zap.Logger
+
+	overallRequestDuration prometheus.ObserverVec
+	overallPoolStats       *prometheus.GaugeVec
+
 	requestDuration prometheus.ObserverVec
 	poolStats       *prometheus.GaugeVec
 
@@ -276,6 +301,28 @@ func (p *ClientPool) populateClients() bool {
 					}
 				})
 			}
+			if p.overallRequestDuration != nil {
+				client.WrapProcess(func(oldProcess func(redis.Cmder) error) func(cmd redis.Cmder) error {
+					return func(cmd redis.Cmder) error {
+						start := time.Now()
+						defer func() {
+							p.overallRequestDuration.WithLabelValues().Observe(time.Since(start).Seconds())
+						}()
+
+						return oldProcess(cmd)
+					}
+				})
+				client.WrapProcessPipeline(func(oldProcess func([]redis.Cmder) error) func([]redis.Cmder) error {
+					return func(cmds []redis.Cmder) error {
+						start := time.Now()
+						defer func() {
+							p.overallRequestDuration.WithLabelValues().Observe(time.Since(start).Seconds())
+						}()
+
+						return oldProcess(cmds)
+					}
+				})
+			}
 
 			validClients = append(validClients, client)
 		}
@@ -299,18 +346,51 @@ func (p *ClientPool) populateClients() bool {
 }
 
 func (p *ClientPool) updatePoolStats() {
-	if p.poolStats == nil {
-		return
+	var clients []*redis.Client
+	getClients := func() {
+		if clients == nil {
+			clients = p.getClients()
+		}
 	}
 
-	for _, client := range p.getClients() {
-		stats := client.PoolStats()
-		p.poolStats.WithLabelValues(client.Options().Addr, "hits").Set(float64(stats.Hits))
-		p.poolStats.WithLabelValues(client.Options().Addr, "misses").Set(float64(stats.Misses))
-		p.poolStats.WithLabelValues(client.Options().Addr, "timeouts").Set(float64(stats.Timeouts))
-		p.poolStats.WithLabelValues(client.Options().Addr, "total_conns").Set(float64(stats.TotalConns))
-		p.poolStats.WithLabelValues(client.Options().Addr, "idle_conns").Set(float64(stats.IdleConns))
-		p.poolStats.WithLabelValues(client.Options().Addr, "stale_conns").Set(float64(stats.StaleConns))
+	if p.poolStats != nil {
+		getClients()
+		for _, client := range clients {
+			stats := client.PoolStats()
+			p.poolStats.WithLabelValues(client.Options().Addr, "hits").Set(float64(stats.Hits))
+			p.poolStats.WithLabelValues(client.Options().Addr, "misses").Set(float64(stats.Misses))
+			p.poolStats.WithLabelValues(client.Options().Addr, "timeouts").Set(float64(stats.Timeouts))
+			p.poolStats.WithLabelValues(client.Options().Addr, "total_conns").Set(float64(stats.TotalConns))
+			p.poolStats.WithLabelValues(client.Options().Addr, "idle_conns").Set(float64(stats.IdleConns))
+			p.poolStats.WithLabelValues(client.Options().Addr, "stale_conns").Set(float64(stats.StaleConns))
+		}
+	}
+
+	if p.overallPoolStats != nil {
+		getClients()
+		var (
+			hits       float64
+			misses     float64
+			timeouts   float64
+			totalConns float64
+			idleConns  float64
+			staleConns float64
+		)
+		for _, client := range clients {
+			stats := client.PoolStats()
+			hits += float64(stats.Hits)
+			misses += float64(stats.Misses)
+			timeouts += float64(stats.Timeouts)
+			totalConns += float64(stats.TotalConns)
+			idleConns += float64(stats.IdleConns)
+			staleConns += float64(stats.StaleConns)
+		}
+		p.overallPoolStats.WithLabelValues("hits").Set(hits)
+		p.overallPoolStats.WithLabelValues("misses").Set(misses)
+		p.overallPoolStats.WithLabelValues("timeouts").Set(timeouts)
+		p.overallPoolStats.WithLabelValues("total_conns").Set(totalConns)
+		p.overallPoolStats.WithLabelValues("idle_conns").Set(idleConns)
+		p.overallPoolStats.WithLabelValues("stale_conns").Set(staleConns)
 	}
 }
 
